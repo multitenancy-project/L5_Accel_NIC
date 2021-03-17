@@ -1,98 +1,112 @@
-### Design Note
+## Design Note 
+
+According to [1], the most efficient way of processing data would be to push as many operations as possible to the data if its currently in the cache or registers. Which means the layered design doesn't make a lot of sense if there are lots of manipulations to the data from application layer all the way down to the network layer. 
+
+> This requires re-design to both API (to replace socket) and the NIC.
+
+the design of ADU should be an End-to-End design:
+
+1. application pushes ADU (i.e. DMA address of the ADU) to the NIC;
+
+   1. the length of ADU is a tradeoff. (video chunks, text message, image, file)
+
+      > I need also consider that the memory on the NIC is limited.
+
+   2. the sender side should provide location info of ADUs in case ADUs arrived out-of-order on the receiver side.
+
+      > or at least the sender and receiver should have high-level agreement on where/when the ADU should be put.
+
+2. NIC is responsible for the ADU to packet conversion and visa verse.
+
+**The ADU-packet conversions must be driven by application knowledge.**
+
+**ADU should take the place of packet for manipulation:**
+
+* can be processed out of order;
+* can be mapped onto memory (user space) separately;
+* smallest unit for error recovery.
 
 
 
-This design together with Menshen is intended for re-constructing the data of the application layer from a number of packets. The ultimate goal is to enable application-acceleration on the NIC. For example, we might want to implement a ML accelerator on the NIC so that the computation can be finished right after network processing units (e.g., a RMT module). Such a design can also be found in the industry community. [SmartNIC](https://www.microsoft.com/en-us/research/uploads/prod/2018/03/Azure_SmartNIC_NSDI_2018.pdf) and [BrainWave](https://www.microsoft.com/en-us/research/uploads/prod/2018/06/ISCA18-Brainwave-CameraReady.pdf) in Microsoft Azure share the same FPGA board for both network processing and DNN acceleration. 
+> 2 types of ADU delivery between NIC & memory:
+>
+> 1. push the data to memory blocks successively (file transfer);
+> 2. copy the data into separate places (as results/parameters of program, RPC.) **hard to achieve.**
 
-![image-20210225152515078](fig/image-20210225152515078.png)
+### Motivation with real-world demos
 
-There are a couple of **requirements** to make the design work in the scenario of Data Centers:
+Two experiments showing the proportion of CPU cycles on the ADU generation (pre-processing). And using perf to obtain the `L3 cache missing rate` and `CPU cycles` spent on data manipulating operations.
 
-> I'm not sure what is missing in the requirements, so I just put the points which are already in my mind here.
+1. Data Vectorization for NLP processing; 
+   1. skip spaces and emojis from the text;
+   2. convert the words to one-hot vectors using dictionary;
+   3.  push the vectors into GRU (matrix multiply) and obtain the final vector.
+2. word aligned copy from R2000 integer to ASN.1;
+   1.  aligned copy to ASN.1 and word aligned.
 
-1. data shall be re-constructed based on the abstraction of **flows** (the definition of **flow** can be as simple as 5-tuple group). Generally, a server in the data center runs multiple processes belonging to different tenants/applications. Thus, the NIC shall be able to isolate those data when there are multiple acceleration cores/pipelines on board.
-2. DDR should be virtualized to enable simultaneous memory-access operations. Again, running multiple acceleration core on the NIC means pushing different data to DDR possibly. And this operation shall also be isolated to avoid disturbance in between.
-3. the design shall be able to generate packets (given flow info in advance) **both on the RX/TX path**. Specifically, packet generation on the RX path allows acceleration core return computation results to the main process on the CPU side. packet generation on the TX path allows a complete bypass of the CPU in the distributed application acceleration scenario (a similar case can be found in [hyperloop](https://dl.acm.org/doi/pdf/10.1145/3230543.3230572)). 
+### Expecting Performance Bottlenecks
 
+	1. manipulations to the data (conversion, compress, encryption);
+	2. random memory access (JAVA objection serialization, file transfer)
 
+### ADU abstraction
 
-#### Relation with Menshen
+As suggested in [1], the definition of ADU (contents, length) is based on application knowledge. There are several types of application that cover most of the services that servers provide in the cloud.
 
-**Data Path:** Because the design is intended for data re-construction of the application layer, it is reasonable place the re-construction module after the network processing module (which in our case is Menshen).
+| Type         | Data Unit   | Size         | Demo                               | Formats        | TX ops        | RX ops                                   |
+| ------------ | ----------- | ------------ | ---------------------------------- | -------------- | ------------- | ---------------------------------------- |
+| large file   | file        | random       | sftp                               | ASCII/EBCDIC   | encryption    | decryption                               |
+| text (NLP)   | sentence    | <1KB         | data-vectorization                 | ASCII          | none          | vectorization (lookup, matrix multiply.) |
+| image        | image       | (500B, 20MB) | decision_tree based face detection | JPEG, PNG, GIF | compress      | decompress, binarization                 |
+| video        | video chunk | (5MB, 50MB)  | MPEG-DASH                          | 264            | DASH proto    | DASH proto                               |
+| JAVA objects | objects     | <128MB       | Cereal[2] / JAVA bulit-in          | byte sequence  | serialization | deserialization                          |
+| undefined    |             |              |                                    |                |               |                                          |
 
-> **Side Note:** What is the relation between the project SmartNIC and BrainWave? Well, after comparing the two design, I'm pretty much convinced that they are actually deployed on the same board. **So the question for me becomes: What is the problem that our design is trying to solve?**
+According to the table above, the size of ADU should range from several types to several hundreds of MB. 
 
-**Compiler:** It shall be noted that instead of reuse Menshen's p4 compiler, the logic in the application acceleration most likely will have its independent compile workflow. 
+**E2E Data Execution Path**: For each type of application:
 
-**Runtime: ** the 2 modules are mostly independent except that: 1) certain rules shall be installed in Menshen to ensure different flows are received/processed by the correct data re-construct module. 2) There shall be a dispatching module between the two for scheduling tasks (namely pushing the traffic to the correct application-acceleration core or vice versa).
+1. on the sender side, the CPU should push the pointer which points to the physical address of the data (can be DMAed) to the NIC together with the metadata (how the ADU should be pre-processed);
+2. The specific ADU-module pulls the ADU from DMA and execute the TX ops (encryption, compress, serialization, etc.);
+3. (ADUs are converted into packets and transferred in the network)
+4. On the receiver side, the RX ops (decryption, vectorization, decompression) that a specific ADU-module should execute are registered right after the application started up;
+5. After the the packet is dispatched from RMT pipeline, the ADU-module obtains packets and re-construct the ADU. Then execute the operations registered before. 
 
-**Placement:** It is reasonable to **isolate** Menshen pipeline with the application acceleration regions on board. Menshen being a RMT-like design is able to perform runtime reconfiguration with the help of P4 abstraction. On the other hand, the application acceleration unit may have several ways for reconfiguration: 1) switch off/on a specific module that is already on the FPGA; 2) using partial reconfiguration to download the specific bitstream on the FPGA; 3) a high level abstraction (similar to P4/RMT) that allows runtime reconfiguration.  
+### Hardware Design
 
+![image-20210317230039197](fig/architecture_draft.png)
 
+#### Pipeline Design (the figures above)
 
-#### Use-cases and Data-flow demonstrations
+Because of the asymmetric feature of the data path, its easier to have separate TX/RX paths on the NIC.
 
-##### 1. NIC-accelerated real-time inference system 
+#### DMA engine (a key part)
 
-![image-20210225210411388](fig/image-20210225210411388.png)
+Instead of packet descriptors, the DMA engine needs to use the abstraction of ADU instead of packet for the communication between NIC and the memory.
 
-> We choose this scenario because: FPGA is proved to be a perfect platform for real-time inference system for its high parallelization without batching.
+### Software Design
 
-Server As and server B are interconnected on the cloud. And a trained DNN-based inference system is implemented on Server B's NIC. Server As send inference requests randomly to B. 
+The API here is mainly to replace the conventional Socket API. Before the NIC is able to process the ADU, certain instructions should be pushed to the NIC:
 
-Before the NIC can be leveraged as an inference system, the request shall be received by the CPU via NIC. After that, the vector contained in the request is extracted and feed into the accelerator (maybe a GPU or FPGA standalone accelerator). The result of the accelerator returns back to the main memory. And then the CPU will issue a response message to the sender (server As). The figure from [N3IC](https://arxiv.org/pdf/2009.02353.pdf) demonstrated the whole process similarly:
+1. underlaying packet header info;
+2. operation type and related metadata (encryption key, JAVA object metadata, etc.);
+3. other info for ADU-packet conversion (e.g., packet size), scheduling priority, forwarding rules.
 
-![image-20210225211918230](fig/image-20210225211918230.png)
+[API design considerations]
 
-After the inference system is implemented on the same FPGA with NIC, the whole process becomes much simpler (and faster).
+### Security Design
 
-1. Firstly server B can use whatever ways (e.g., partial reconfiguration) to offload the inference system on the NIC.
-2. Server B should also install a rule on Menshen, which include the serving ip_addr, ports, etc. of the inference application. So that the NIC knows when to send data to the acceleration core on the NIC.
-3. Server As send requests without knowing the inference system is offloaded on the NIC.
-4. Server B's NIC receives the request and response to the sender after the result is calculated. 
-
-**Problem:** Microsoft's Brainwave has such a similar design the avoids CPU involvement with pure FPGA accelerator clusters.
-
-#### Hardware Architecture
-
-##### 1. Simplifications
-
-1. Currently, the design doesn't take stateful protocols (TCP, QUIC, etc.) into account. 
-
-   >  A full-offloading of TCP state machine has been proofed extremely time and resource-consuming on FPGA. On the other hand, a large portion of traffic inside DC is UDP-based, which makes the simplification reasonable.
-
-2. Data belonging to different applications doesn't appear in the same packet.
-
-   > This simplification avoids the design to split packet payload, which is a performance-killing operation on the hardware (will require many bit shift ops). And this is also reasonable since traffic of different application shall have different 5-tuple group, which we will use as the way of identifying traffic.
-
-3. DRAM access from Menshen and application acceleration units are physically isolated (use different pins/DDR).
-
-   > It avoids potential complex DDR access control thus we can focusing on the DDR virtualization only for application acceleration units. ***sidenote: there should be a bunch of research discussing how this can be done. Thus, I'm afraid this part would be more of an engineering implementation.*** 
-
-##### 2. Overall Architecture
-
-First of all, we need a architectural "fix" in the NIC to change the way how Menshen is inserted (as shown in the figure below). Traditional NIC has separated TX and RX paths. However, a switching fabric is needed to perform virtual switch operations in modern data centers. With such a modification to the NIC, a single Menshen module will be able to fully operate the packets from both directions, thus avoiding putting two identical Menshen both on the TX and RX path (resource waste). 
-
-![image-20210225220645183](fig/image-20210225220645183.png)
+isolation between different ADUs/applications.
 
 
 
-As depicted in the figure below, Acceleration module is attached to Dispatch. 
+### Reference
 
-Dispatch module is responsible of dispatching packet based on metadata attached on the packet. For example, if the packet is a request message to Acceleration Module, a specific rule will be matched in Menshen Switch Fabric and the destination (namely a specific acceleration core on the NIC) will be written to the metadata. Dispatch module checked the destination and dispatch the packet to Acceleration Module accordingly.
+[1] Architectural Considerations for a New Generation of Protocols.
 
-Acceleration Module is responsible for application acceleration and is the core module in this design. Beside data from the network (UDP/IP or RDMA), Acceleration Module also has access to extern DRAM via DDR and main memory via PCIe/DMA.
-
-![image-20210225220606810](fig/image-20210225220606810.png)
-
-#### Software Design
+[2] A Specialized Architecture for Object Serialization with Applications to Big Data Analytics.
 
 
-
-**Note:**
-
-1. different application may use different protocols to convey data. A general module to extract payload out of packets may not be preferred.
-2. is it reasonable that RX/TX path are merged with an arbiter and using a switching module to direct the RX/TX traffic. 
 
  
 
