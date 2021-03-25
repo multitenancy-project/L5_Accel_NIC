@@ -119,7 +119,7 @@ On the TX path:
 
 **Queue Management**: In order to support isolated multiple ADUs processing on the NIC, a multi-queue DMA engine is needed. The high-level DMA design can be shown in the figure below:
 
-![DMA_design](fig\DMA.png) 
+![DMA_design](fig/DMA.png) 
 
 The key feature of the DMA is that: **each ADU module has its own descriptor queue that it can operate with.** the MUX module schedules DMA requests from each ADU module and issues DMA transactions to the memory. On the software side, **each application has separated buffer in the kernel (can be mapped to user-space by `mmap()` system call)**. In this way, the ADU of each application is completely isolated (if everyone behave well).
 
