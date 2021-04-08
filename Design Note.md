@@ -53,6 +53,8 @@ Two experiments showing the proportion of CPU cycles on the ADU generation (pre-
 
 As suggested in [1], the definition of ADU (contents, length) is based on application knowledge. There are several types of application that cover most of the services that servers provide in the cloud.
 
+**application type to support: **e.g., key-value stores,data analytics, machine learning training, web crawling, and scientific computing. 
+
 | Type         | Data Unit   | Size         | Demo                      | Formats        | TX ops                 | RX ops                                   | IP  cores                          |
 | ------------ | ----------- | ------------ | ------------------------- | -------------- | ---------------------- | ---------------------------------------- | ---------------------------------- |
 | large file   | file        | random       | sftp                      | ASCII/EBCDIC   | encryption/compression | decryption/decompression                 | https://github.com/linuxbest/lzs   |
@@ -76,52 +78,73 @@ According to the table above, the size of ADU should range from several types to
 
 ![image-20210317230039197](fig/architecture_draft.png)
 
-#### Pipeline Design (the figures above)
+#### Pipeline Design
 
-Because of the asymmetric feature of the data path, its easier to have separate TX/RX paths on the NIC.
+![DMA_design](fig/DMA.png)
 
-##### RMT pipeline
+The overall design is shown as the figure above. The left side is connected with qsfp28 network ports while the right side is connected with the host using PCIe (PCIe3.0 x16).
 
-The switch fabric on the NIC. Beside basic switch services, in this project, the RMT pipeline can be used to **reformatting packet headers** for each packet on the TX path. For example, the ADU sends out the payload wrapped in a **fake packet header** (using a same length of `EtherHdr`+`IPHdr`+`UDPHdr`, but just contains an internal ADU ID). Then the RMT pipeline is responsible for replacing the ADU index with the correct packet header that the user configured using p4.
+##### 1. DMA design
 
-On the RX path, the RMT pipeline will re-direct the packet to the determined ADU module according to the rules offloaded by the user by his p4 code.
+![dma_part](fig/dma_part.png)
 
-##### Scheduler
+The multi-queue DMA in the design is adopted from the DMA engine in [corundum](https://github.com/Winters123/verilog-pcie) as it can be easily extended to support high-speed multi-channels for ADU modules.
 
-Scheduler is connected with ADU modules and Dispatch module using a flexible crossbar (with a simplified switch table instead). On the TX path, Scheduler is responsible for scheduling ADUs to different ADU modules. On the other hand, Scheduler is implemented as a typical **N to 1** scheduler to push ADUs back to the host. 
+The DMA system can be divided into **Data Channel** (RQ & RC) and **Configure Channel** (CQ & CC). Data Channel is responsible for ADU transferring between NIC and the host memory, while configure channel is used to expose the BAR0 configuration space to the host.
 
-Beside ADUs, the scheduler needs also deliver DMA requests (read & write) from ADU modules to the DMA engine. 
+**The scheduler** is responsible for scheduling ADUs across applications on the software and ADU modules on the hardware. For the TX path, which ADU module that a block of data feed into is directed by the scheduler. Thus, a **redirect table** is implemented inside. The format of the table entry should be like: |  APP_ID  |  ADU_ID   |. Considering the ADU is tightly coupled with a specific application on the software, its reasonable that we use **16b L4 port ID** as the **APP_ID **. And the **8b ADU_ID** is the **sequence number of  a specific ADU module** on the NIC. Thus, the scheduler is able to redirect the ADU correctly to the ADU module.
 
-##### Dispatch
+![image-20210325201744485](fig/redirect_table.png)
 
-The dispatch module directly connects to the DMA engine which is used to write/read data to/out of the main memory. On the TX path, it receives DMA read request from ADU modules (time division multiplexed) and reads the requested data from the main memory (via DMA), then reads ADUs from DMA engine to the scheduler (with the metadata related). 
+For the RX path, the data path is decided by the RMT pipeline. We use p4 to control the data path of the ADU coming from the network. Same as the TX path, there is also a **redirect table** (implemented in RMT pipeline), which entry has two similar fields: | APP_ID  |  ADU_ID |. The **16b APP_ID** is actually the **port ID on L4**.
 
-On the RX path, it passes DMA write request from ADU module to the DMA engine and write the ADU back to the main memory.
+P.S. _The dispatch module will be implemented as the DMA engine on the NIC._
 
-##### ADU Modules (multi-queue DMA)
-
-**each ADU module contains an `address management unit` for data delivery between NIC and the main memory.**
-
-ADU module is the key module which performs the data pre-processing to the raw data received from DMA or the packet from network interface. There are a couple of operations ADU modules need to perform on the RX/TX paths separately.
-
-On the RX path:
-
-1. ADU reformatting: reorder the packet, deprive the packet header and reformat the ADU in a form that can be processed directly by the ADU module;
-2. ADU processing: computing tasks include compression/decompression, decryption/encryption, serialization/deserialization, encoding/decoding, etc.
-3. DMA write issuing: depending on different types of data-preprocessing, the ADU module issues different types of DMA write (block or scatter-gather).
+---
 
 On the TX path:
 
-1. ADU processing: computing tasks include compression/decompression, encryption/decryption, serialization/deserialization, encoding/decoding, etc.;
-2. DMA read issuing: depending on different types of data-preprocessing and the remained address in the **address management unit**, the ADU module issues different types of DMA read to the main memory.
+1. After the driver is initialized by the host, the DMA-able buffer space on the memory is waiting to be filled by the application;
+2. The application writes ADU to the buffer space. Once its done, the CPU writes the descriptor to BAR 0 exposed by PCIe configure channel (CQ interface);
+3. The MUX module (middle of the figure) directs the descriptor to the correct DMA module according to the `ADU_ID` carried in it;
+4. the DMA module issues a DMA read according to the descriptor and push the ADU data to the ADU module for further process. 
+
+On the RX path:
+
+1. After the ADU are extracted/processed by the ADU module, it is pushed to the FIFO that DMA module maintains;
+2. The DMA module obtains a descriptor from the desc-queue and issues a DMA write;
+3. The write request is converted to a write transaction on the RQ interface and sent to the memory;
+4. The memory tells the DMA module when the transaction is finished via RC interface.
+
+---
+
+##### 2. Scheduler
+
+Scheduler is connected with ADU modules with the DMA interface using a flexible crossbar (with a simplified switch table). On the TX path, Scheduler is responsible for scheduling ADUs to different ADU modules. On the other hand, Scheduler is implemented as a typical **N to 1** scheduler to push ADUs back to the host. 
+
+##### 3. ADU Modules
+
+ADU module is the core module on the NIC. Its responsible for executing the presentation layer operations (compression/decompression, etc.).
+
+##### 4. Packet Wrapper
+
+Packet Wrapper is for the conversion between 'packet' and 'ADU'. On the RX path, it extracts the payload from the packet and reformats the ADU for further processing in the ADU module; On the TX path, it adds packet header to the ADU data and push the packets to the RMT pipeline.
+
+> For ADUs larger than MTU, the ADU may be split into several packets according to the size of MTU. For ADUs smaller than the MTU, several ADUs can be packed to one packet to make the better use of bandwidth. 
+
+On the RX path, the RMT pipeline helps to determine which ADU_ID it belongs to. Thus, the packet wrapper only needs to extract the payload out of the packet based on the length of the header. On the TX path, the packet wrapper also need to add a **fake header** to the ADU based on the length of the header. And the correct header can be attached to it in the RMT pipeline.
+
+A key data structure here is a **mapping table** to attach/detach packet headers to ADUs. The table should contain the mapping relation between **ADU_ID** and **Header_Length**.
+
+![map_table](fig/map_table.png)
+
+##### 5. RMT pipeline
+
+The switch fabric on the NIC. Beside basic switch services, the RMT pipeline can be used to **reformatting packet headers** for each packet on the TX path. For example, the ADU sends out the payload wrapped in a **fake packet header** (using a same length of `EtherHdr`+`IPHdr`+`UDPHdr`, but just contains an internal ADU ID). Then the RMT pipeline is responsible for replacing the ADU index with the correct packet header that the user configured using p4 code.
+
+On the RX path, the RMT pipeline will re-direct the packet to the determined ADU module according to the rules offloaded by the user by his p4 code.
 
 
-
-**Queue Management**: In order to support isolated multiple ADUs processing on the NIC, a multi-queue DMA engine is needed. The high-level DMA design can be shown in the figure below:
-
-![DMA_design](fig/DMA.png) 
-
-The key feature of the DMA is that: **each ADU module has its own descriptor queue that it can operate with.** the MUX module schedules DMA requests from each ADU module and issues DMA transactions to the memory. On the software side, **each application has separated buffer in the kernel (can be mapped to user-space by `mmap()` system call)**. In this way, the ADU of each application is completely isolated (if everyone behave well).
 
 **Descriptor Design**: The descriptor needs to include info such as address, data size, ADU ID, etc. Thus, a simple format we can use for descriptor is:
 
@@ -146,17 +169,17 @@ struct simple_desc{
 
 To work with NIC properly, the software side should also maintain the data path that ADUs from a specific application should go through. **ADU Manager** is responsible for data path configuration in this regard. It works as an independent process. The data path determinations of TX/RX path have different considerations:
 
-For the TX path, which ADU module that a block of data feed into is directed by the scheduler. Thus, its clear that the software side should be able to config a **redirect table** (implemented on the NIC) before firing up the application (who has a corresponding ADU module on the NIC). The format of the table entry should be like: |  ADU_ID  |  Channel_ID   |. Considering the ADU is tightly coupled with a specific application on the software, its reasonable that we use **16b L4 port ID** as the **ADU_ID **. And the **8b Channel_ID** is the **sequence number of  a specific ADU module** on the NIC. Thus, the scheduler is able to redirect the ADU correctly to the ADU module.
+For the TX path, which ADU module that a block of data feed into is directed by the scheduler. Thus, the software side should be able to config a **redirect table** (implemented on the NIC) before firing up the application (who has a corresponding ADU module on the NIC). The format of the table entry should be like: |  APP_ID  |  ADU_ID   |. Considering the ADU is tightly coupled with a specific application on the software, its reasonable that we use **16b L4 port ID** as the **APP_ID **. And the **8b ADU_ID** is the **sequence number of  a specific ADU module** on the NIC. Thus, the scheduler is able to redirect the ADU correctly to the ADU module.
 
 ![image-20210325201744485](fig/redirect_table.png)
 
-For the RX path, the data path is decided by the RMT pipeline. Thus, its natural to use p4 to control the data path of the ADU coming from the network. Same as the TX path, there is also a **redirect table** (implemented in RMT pipeline), which entry has two similar fields: | ADU_ID  |  Channel_ID |. The **16b ADU_ID** is actually the **port ID on L4**.
+For the RX path, the data path is decided by the RMT pipeline. We use p4 to control the data path of the ADU coming from the network. Same as the TX path, there is also a **redirect table** (implemented in RMT pipeline), which entry has two similar fields: | APP_ID  |  ADU_ID |. The **16b APP_ID** is actually the **port ID on L4**.
 
-#### Application
+#### Application [TODO]
 
-The application on the software runs exact the same as applications running on conventional servers, except that it doesn't use socket for data send/receive.
+[TODO] The application on the software runs exact the same as applications running on conventional servers, except that it doesn't use socket for data send/receive.
 
-#### SW-HW Interface
+#### SW-HW Interface [TODO]
 
 In order to perform the ADU processing correctly on the NIC, certain API/data structures shall be used to config the switch pipeline and ADU modules as needed. For  
 
@@ -185,6 +208,8 @@ OK, things are a little bit tricky. Even with a user-space DMA mechanism, the bu
 ##### 2. How the NIC works with partial reconfiguration?
 
 since the NIC hasn't to be fully implemented using FPGA, partial reconfiguration is only optional here. However, the skeleton of the NIC should be FPGA based, which makes partial reconfiguration possible for a FPGA-based ADU module.
+
+##### 3.How to deal with flexible size of ADUs on the RX path?
 
 ### Reference
 
