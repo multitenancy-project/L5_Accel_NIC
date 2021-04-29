@@ -1,10 +1,10 @@
 ## Design Note 
 
-According to [1], the most efficient way of processing data would be to push as many operations as possible to the data if its currently in the cache or registers. Which means the layered design doesn't make a lot of sense if there are lots of manipulations to the data from application layer all the way down to the network layer. 
+As pointed out by Google in 2015, 22%-27% CPU cycles in its data centers are spent in presentation layer operations [3] (compression/decompression, rpc, etc.). As a result, offloading the presentation layer onto programmable NICs is a promising way to save CPU cycles for applications.
 
 > This requires re-design to both API (to replace socket) and the NIC.
 
-the design of ADU should be an End-to-End design:
+The architecture should be an End-to-End design:
 
 1. application pushes ADU (i.e. DMA address of the ADU) to the NIC;
 
@@ -16,7 +16,7 @@ the design of ADU should be an End-to-End design:
 
       > or at least the sender and receiver should have high-level agreement on where/when the ADU should be put.
 
-2. NIC is responsible for the ADU to packet conversion and visa verse.
+2. NIC is responsible for the ADU <--> packet conversion and visa verse.
 
 **The ADU-packet conversions must be driven by application knowledge.**
 
@@ -44,7 +44,7 @@ Two experiments showing the proportion of CPU cycles on the ADU generation (pre-
 2. word aligned copy from R2000 integer to ASN.1;
    1.  aligned copy to ASN.1 and word aligned.
 
-### Expecting Performance Bottlenecks
+### Expected Performance Bottlenecks
 
 	1. manipulations to the data (conversion, compress, encryption);
 	2. random memory access (JAVA objection serialization, file transfer)
@@ -66,13 +66,13 @@ As suggested in [1], the definition of ADU (contents, length) is based on applic
 
 According to the table above, the size of ADU should range from several types to several hundreds of MB. 
 
-**E2E Data Execution Path**: For each type of application:
+**E2E Data Execution Path**: For each application:
 
-1. on the sender side, the CPU should push the pointer which points to the physical address of the data (can be DMAed) to the NIC together with the metadata (how the ADU should be pre-processed);
+1. on the sender side, the CPU should push the descriptor which points to the physical address of the data (can be DMAed) to the NIC together with the metadata (ADU_ID, ADU length);
 2. The specific ADU-module pulls the ADU from DMA and execute the TX ops (encryption, compress, serialization, etc.);
-3. (ADUs are converted into packets and transferred in the network)
+3. ADUs are converted into packets and transferred in the network
 4. On the receiver side, the RX ops (decryption, vectorization, decompression) that a specific ADU-module should execute are registered right after the application started up;
-5. After the the packet is dispatched from RMT pipeline, the ADU-module obtains packets and re-construct the ADU. Then execute the operations registered before. 
+5. After the the packet is dispatched from RMT pipeline, the ADU-module obtains packets and re-construct the ADU. Then execute the operations registered before.
 
 ### Hardware Design
 
@@ -82,13 +82,13 @@ According to the table above, the size of ADU should range from several types to
 
 ![DMA_design](fig/DMA.png)
 
-The overall design is shown as the figure above. The left side is connected with qsfp28 network ports while the right side is connected with the host using PCIe (PCIe3.0 x16).
+The overall design is shown as the figure above. The left side is connected with network interfaces (qsfp28 ports) while the right side is connected with the host using PCIe (PCIe3.0 x16).  
 
 ##### 1. DMA design
 
 ![dma_part](fig/dma_part.png)
 
-The multi-queue DMA in the design is adopted from the DMA engine in [corundum](https://github.com/Winters123/verilog-pcie) as it can be easily extended to support high-speed multi-channels for ADU modules.
+The multi-queue DMA in the design is adopted from the DMA engine in [corundum](https://github.com/Winters123/verilog-pcie) as it can be extended to support high-speed multi-channels for ADU modules.
 
 The DMA system can be divided into **Data Channel** (RQ & RC) and **Configure Channel** (CQ & CC). Data Channel is responsible for ADU transferring between NIC and the host memory, while configure channel is used to expose the BAR0 configuration space to the host.
 
@@ -104,7 +104,7 @@ P.S. _The dispatch module will be implemented as the DMA engine on the NIC._
 
 On the TX path:
 
-1. After the driver is initialized by the host, the DMA-able buffer space on the memory is waiting to be filled by the application;
+1. After the driver is initialized, the DMA-able buffer space on the memory is waiting to be filled by the application;
 2. The application writes ADU to the buffer space. Once its done, the CPU writes the descriptor to BAR 0 exposed by PCIe configure channel (CQ interface);
 3. The MUX module (middle of the figure) directs the descriptor to the correct DMA module according to the `ADU_ID` carried in it;
 4. the DMA module issues a DMA read according to the descriptor and push the ADU data to the ADU module for further process. 
@@ -120,19 +120,19 @@ On the RX path:
 
 ##### 2. Scheduler
 
-Scheduler is connected with ADU modules with the DMA interface using a flexible crossbar (with a simplified switch table). On the TX path, Scheduler is responsible for scheduling ADUs to different ADU modules. On the other hand, Scheduler is implemented as a typical **N to 1** scheduler to push ADUs back to the host. 
+Scheduler is connected with ADU modules with the DMA interface using a flexible crossbar (with a simplified switch table). On the TX path, Scheduler is responsible for scheduling ADUs to different ADU modules. On the opposed direction, Scheduler is implemented as a typical **N to 1** scheduler to push ADUs back to the host. 
 
 ##### 3. ADU Modules
 
-ADU module is the core module on the NIC. Its responsible for executing the presentation layer operations (compression/decompression, etc.).
+ADU module is the core functional module on the NIC. Its responsible for executing the presentation layer operations (compression/decompression, etc.).
 
-##### 4. Packet Wrapper
+##### 4. Segmenter & Assembler
 
-Packet Wrapper is for the conversion between 'packet' and 'ADU'. On the RX path, it extracts the payload from the packet and reformats the ADU for further processing in the ADU module; On the TX path, it adds packet header to the ADU data and push the packets to the RMT pipeline.
+Segmenter & Assembler is for the conversion between 'packet' and 'ADU'. On the RX path, it extracts the payload from the packet and reformats the ADU for further processing in the ADU module; On the TX path, it adds packet header to the ADU data and push the packets to the RMT pipeline.
 
-> For ADUs larger than MTU, the ADU may be split into several packets according to the size of MTU. For ADUs smaller than the MTU, several ADUs can be packed to one packet to make the better use of bandwidth. 
+> For ADUs larger than MTU, the ADU may be segmented into several packets according to the size of MTU. For ADUs smaller than the MTU, several ADUs can be assembled to one packet to make the better use of bandwidth. 
 
-On the RX path, the RMT pipeline helps to determine which ADU_ID it belongs to. Thus, the packet wrapper only needs to extract the payload out of the packet based on the length of the header. On the TX path, the packet wrapper also need to add a **fake header** to the ADU based on the length of the header. And the correct header can be attached to it in the RMT pipeline.
+On the RX path, the RMT pipeline helps to determine which ADU_ID it belongs to. Thus, the Segmenter only needs to extract the payload out of the packet based on the length of the header. On the TX path, the Assembler also need to add a **fake header** to the ADU based on the length of the header. And the correct header can be attached to it in the RMT pipeline.
 
 A key data structure here is a **mapping table** to attach/detach packet headers to ADUs. The table should contain the mapping relation between **ADU_ID** and **Header_Length**.
 
@@ -216,6 +216,8 @@ since the NIC hasn't to be fully implemented using FPGA, partial reconfiguration
 [1] Architectural Considerations for a New Generation of Protocols.
 
 [2] A Specialized Architecture for Object Serialization with Applications to Big Data Analytics.
+
+[3] Profiling a warehouse-scale computer.
 
 
 
