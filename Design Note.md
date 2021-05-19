@@ -130,6 +130,8 @@ ADU module is the core functional module on the NIC. Its responsible for executi
 
 Segmenter & Assembler is for the conversion between 'packet' and 'ADU'. On the RX path, it extracts the payload from the packet and reformats the ADU for further processing in the ADU module; On the TX path, it adds packet header to the ADU data and push the packets to the RMT pipeline.
 
+![s&a](fig/s&a.png)
+
 > For ADUs larger than MTU, the ADU may be segmented into several packets according to the size of MTU. For ADUs smaller than the MTU, several ADUs can be assembled to one packet to make the better use of bandwidth. 
 
 On the RX path, the RMT pipeline helps to determine which ADU_ID it belongs to. Thus, the Segmenter only needs to extract the payload out of the packet based on the length of the header. On the TX path, the Assembler also need to add a **fake header** to the ADU based on the length of the header. And the correct header can be attached to it in the RMT pipeline.
@@ -137,6 +139,8 @@ On the RX path, the RMT pipeline helps to determine which ADU_ID it belongs to. 
 A key data structure here is a **mapping table** to attach/detach packet headers to ADUs. The table should contain the mapping relation between **ADU_ID** and **Header_Length**.
 
 ![map_table](fig/map_table.png)
+
+On the TX path, Hdr_adder is responsible for add packet headers before ADU (payload). the exact packet header can be retrieved by matching the ADU_ID with a `header adder table`. This table also determines the length of each packet. Thus users can determine the size of the packet regardless of the size of ADU.
 
 ##### 5. RMT pipeline
 
